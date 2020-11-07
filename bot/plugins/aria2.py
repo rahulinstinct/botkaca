@@ -1,55 +1,90 @@
-# GOAL:
-# getting track for logging
+from bot import aria2, download_dict_lock, STOP_DUPLICATE_MIRROR
+from bot.helper.mirror_utils.upload_utils.gdriveTools import GoogleDriveHelper
+from bot.helper.ext_utils.bot_utils import *
+from .download_helper import DownloadHelper
+from bot.helper.mirror_utils.status_utils.aria_download_status import AriaDownloadStatus
+from bot.helper.telegram_helper.message_utils import *
+import threading
+from aria2p import API
+from time import sleep
 
-import logging
 
-LOGGER = logging.getLogger(__name__)
+class AriaDownloadHelper(DownloadHelper):
 
-# GOAL:
-# create aria2 handler class
+    def __init__(self):
+        super().__init__()
 
-import asyncio
-import aria2p
+    @new_thread
+    def __onDownloadStarted(self, api, gid):
+        sleep(1.5)
+        LOGGER.info(f"onDownloadStart: {gid}")
+        dl = getDownloadByGid(gid)
+        download = api.get_download(gid)
+        self.name = download.name
+        sname = download.name
+        gdrive = GoogleDriveHelper(None)
+        smsg = gdrive.drive_slist(sname)
+        if STOP_DUPLICATE_MIRROR:
+            if smsg:
+                dl.getListener().onDownloadError(f'😡😡<code>File is already available in drive. You should have search before mirror any file.</code> <b>You might get ban if you do this again.</b> <code>This download has been stopped.</code>\n\n Here are the search results:👇👇 \n\n{smsg}')
+                aria2.remove([download])
+            return
+        update_all_messages()
 
-class aria2(aria2p.API):
-    __api =  None
-    __config = {
-        "dir" : "downloads",
-        "daemon" : "true",
-        "max-connection-per-server" : "10",
-        "rpc-listen-all" : "false",
-        "rpc-listen-port": "6800",
-        "seed-ratio" : "0",
-        "seed-time" : "0"
-    }
-    __process = None
+    def __onDownloadComplete(self, api: API, gid):
+        LOGGER.info(f"onDownloadComplete: {gid}")
+        dl = getDownloadByGid(gid)
+        download = api.get_download(gid)
+        if download.followed_by_ids:
+            new_gid = download.followed_by_ids[0]
+            new_download = api.get_download(new_gid)
+            with download_dict_lock:
+                download_dict[dl.uid()] = AriaDownloadStatus(new_gid, dl.getListener())
+                if new_download.is_torrent:
+                    download_dict[dl.uid()].is_torrent = True
+            update_all_messages()
+            LOGGER.info(f'Changed gid from {gid} to {new_gid}')
+        else:
+            if dl: threading.Thread(target=dl.getListener().onDownloadComplete).start()
 
-    def __init__(self, config={}):
-        self.__config.update(config)
+    @new_thread
+    def __onDownloadPause(self, api, gid):
+        LOGGER.info(f"onDownloadPause: {gid}")
+        dl = getDownloadByGid(gid)
+        dl.getListener().onDownloadError('Download stopped by user!')
 
-    async def start(self):
-        if not self.__process:
-            cmd = [
-                "aria2c",
-                "--enable-rpc"
-            ]
-            for key in self.__config:
-                cmd.append(f"--{key}={self.__config[key]}")
-            LOGGER.info(cmd)
-            self.__process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            stdout, stderr = await self.__process.communicate()
-            LOGGER.info(stderr or stdout)
-        if not self.__api:
-            self.__api = aria2p.API(
-                aria2p.Client(
-                    host="http://localhost",
-                    port=int(self.__config['rpc-listen-port'])
-                )
-            )
-    
-    def __getattr__(self, name):
-        return getattr(self.__api, name)
+    @new_thread
+    def __onDownloadStopped(self, api, gid):
+        LOGGER.info(f"onDownloadStop: {gid}")
+        dl = getDownloadByGid(gid)
+        if dl: dl.getListener().onDownloadError('Download stopped by user!')
+
+    @new_thread
+    def __onDownloadError(self, api, gid):
+        sleep(0.5) #sleep for split second to ensure proper dl gid update from onDownloadComplete
+        LOGGER.info(f"onDownloadError: {gid}")
+        dl = getDownloadByGid(gid)
+        download = api.get_download(gid)
+        error = download.error_message
+        LOGGER.info(f"Download Error: {error}")
+        if dl: dl.getListener().onDownloadError(error)
+
+    def start_listener(self):
+        aria2.listen_to_notifications(threaded=True, on_download_start=self.__onDownloadStarted,
+                                      on_download_error=self.__onDownloadError,
+                                      on_download_pause=self.__onDownloadPause,
+                                      on_download_stop=self.__onDownloadStopped,
+                                      on_download_complete=self.__onDownloadComplete)
+
+
+    def add_download(self, link: str, path,listener):
+        if is_magnet(link):
+            download = aria2.add_magnet(link, {'dir': path})
+        else:
+            download = aria2.add_uris([link], {'dir': path})
+        if download.error_message: #no need to proceed further at this point
+            listener.onDownloadError(download.error_message)
+            return 
+        with download_dict_lock:
+            download_dict[listener.uid] = AriaDownloadStatus(download.gid,listener)
+            LOGGER.info(f"Started: {download.gid} DIR:{download.dir} ")
